@@ -7,7 +7,7 @@ A machine learning pipeline for predicting agitation states in dementia patients
 This project implements a comprehensive data science pipeline that:
 - Processes multimodal sensor data (physiological vitals, sleep patterns, activity sensors)
 - Handles missing data through iterative imputation
-- Aggregates hourly measurements to daily behavioral patterns
+- Aggregates hourly measurements to daily behavioural patterns
 - Applies feature engineering and selection techniques
 - Trains multiple classification models to predict daily agitation events
 - Provides model evaluation and cross-validation results
