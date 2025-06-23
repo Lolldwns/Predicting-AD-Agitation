@@ -1,0 +1,402 @@
+# Patient Agitation Prediction Model
+# Machine Learning model to predict agitation states in dementia patients using physiological and environmental data
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import warnings
+from collections import Counter
+from scipy import stats
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.feature_selection import SelectFromModel
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.naive_bayes import GaussianNB
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from imblearn.over_sampling import SMOTE
+
+warnings.filterwarnings("ignore")
+
+# Set random seed for reproducibility
+SEED = 100
+np.random.seed(SEED)
+
+# =============================================================================
+# DATA LOADING AND INITIAL SETUP
+# =============================================================================
+
+def load_data(data_path):
+    """Load training and test datasets."""
+    train_df = pd.read_csv(os.path.join(data_path, 'train.csv'))
+    test_df = pd.read_csv(os.path.join(data_path, 'test.csv'))
+    return train_df, test_df
+
+def create_validation_split(train_df, n_patients=5):
+    """Create validation set by randomly selecting patients."""
+    train_df_full = train_df.copy()
+    
+    # Randomly choose patients for validation
+    pids = np.random.choice(train_df['subject'].unique(), size=n_patients, replace=False)
+    valid_df = pd.DataFrame()
+    for pid in pids:
+        valid_df = pd.concat([valid_df, train_df.loc[train_df['subject'] == pid]])
+    
+    train_df = train_df[~train_df['subject'].isin(pids)]
+    return train_df, valid_df, train_df_full
+
+# =============================================================================
+# DATA AGGREGATION
+# =============================================================================
+
+def aggregate_function(df, keys, global_agg_fn='max'):
+    """Aggregate hourly data to daily format using specified aggregation function."""
+    
+    # Perform global aggregation
+    if global_agg_fn == 'sum':
+        agg_df = df.groupby(keys).agg(lambda x: x.sum() if not x.isna().all() else np.nan)
+    else:
+        agg_df = df.groupby(keys).agg(global_agg_fn) 
+
+    # Handle categorical feature separately (mode aggregation)
+    agg_df['global_tib'] = df.groupby(keys)['global_tib'].agg(
+        lambda x: x.mode()[0] if len(x.mode()) > 0 else None
+    ) 
+
+    # Drop the 'hour' column
+    agg_df = agg_df.drop(['hour'], axis=1)
+    return agg_df
+
+def aggregate_datasets(train_df, valid_df, test_df, train_df_full):
+    """Aggregate all datasets and convert labels to boolean."""
+    keys = ['subject', 'date']
+    
+    # Aggregate datasets
+    agg_train_df = aggregate_function(train_df, keys=keys)
+    agg_valid_df = aggregate_function(valid_df, keys=keys)
+    agg_test_df = aggregate_function(test_df, keys=keys)
+    agg_train_full_df = aggregate_function(train_df_full, keys=keys)
+    
+    # Convert labels to boolean (any agitation during day = True)
+    agg_train_df['label'] = agg_train_df['label'] > 0
+    agg_valid_df['label'] = agg_valid_df['label'] > 0
+    agg_train_full_df['label'] = agg_train_full_df['label'] > 0
+    
+    return agg_train_df, agg_valid_df, agg_test_df, agg_train_full_df
+
+# =============================================================================
+# DATA IMPUTATION
+# =============================================================================
+
+def impute_missing_values(df, cols):
+    """Impute missing values using iterative imputation for specified columns."""
+    imputed_df = df.copy()
+    
+    # Initialize and apply iterative imputer
+    imputer = IterativeImputer(random_state=SEED)
+    imputed_df[cols] = imputer.fit_transform(imputed_df[cols])
+    
+    # Fill remaining missing activity values with zero
+    imputed_df = imputed_df.fillna(0)
+    
+    return imputed_df
+
+# =============================================================================
+# DATA TRANSFORMATION
+# =============================================================================
+
+def transform_categorical_features(df_list):
+    """Transform categorical variables and apply one-hot encoding."""
+    transformed_dfs = []
+    
+    for df in df_list:
+        df_copy = df.copy()
+        df_copy["global_tib"] = df_copy["global_tib"].astype('category')
+        transformed_dfs.append(df_copy)
+    
+    # Get categories from training data
+    categories = transformed_dfs[0]["global_tib"].cat.categories
+    
+    # Convert to codes and apply one-hot encoding
+    for i, df in enumerate(transformed_dfs):
+        if i == 0:  # Training data
+            df["global_tib"] = df["global_tib"].cat.codes
+        else:  # Other datasets
+            df["global_tib"] = pd.Categorical(df["global_tib"], categories=categories).codes
+        
+        # One-hot encode
+        transformed_dfs[i] = pd.get_dummies(df, columns=['global_tib'])
+    
+    # Ensure consistent columns across datasets
+    train_global_tib_cols = [col for col in transformed_dfs[0].columns if 'global_tib' in col]
+    
+    for i in range(1, len(transformed_dfs)):
+        df_global_tib_cols = [col for col in transformed_dfs[i].columns if 'global_tib' in col]
+        missing_cols = [col for col in train_global_tib_cols if col not in df_global_tib_cols]
+        
+        for col in missing_cols:
+            transformed_dfs[i][col] = False
+    
+    return transformed_dfs
+
+def convert_to_boolean(df_list, bool_cols):
+    """Convert specified integer columns to boolean."""
+    for df in df_list:
+        for col in bool_cols:
+            df[col] = df[col].apply(lambda x: True if x > 0 else False)
+    return df_list
+
+def visualize_feature_distributions(df, scaling_cols):
+    """Create histograms for numerical features to understand distributions."""
+    fig, axes = plt.subplots(10, 2, figsize=(25, 30))
+    colors = plt.rcParams["axes.prop_cycle"]()
+    
+    for ax, col in zip(np.ravel(axes), scaling_cols):
+        ax.hist(df[col], color=next(colors)["color"], bins=20)
+        ax.set_title(f"{col.title()} Histogram")
+        ax.set_ylabel('Frequency')
+        ax.set_xlabel('Value')
+    
+    fig.subplots_adjust(hspace=0.75, wspace=0.25)
+    plt.show()
+
+def check_outliers(df, scaling_cols, threshold=3):
+    """Check for outliers using Z-score method."""
+    z = np.abs(stats.zscore(df[scaling_cols]))
+    outliers = (z > threshold)
+    total_outliers = np.sum(outliers)
+    
+    print(f"Number of outliers: {total_outliers}")
+    print(f"Total Number of Datapoints: {df[scaling_cols].size}")
+    print(f"Percentage of Outliers: {total_outliers/df[scaling_cols].size * 100:.2f}%")
+    
+    return total_outliers
+
+def apply_scaling(df_list, scaling_cols):
+    """Apply MinMax scaling to numerical features."""
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_dfs = []
+    
+    # Fit scaler on training data and transform all datasets
+    for i, df in enumerate(df_list):
+        df_copy = df.copy()
+        if i == 0:  # Training data
+            df_copy[scaling_cols] = scaler.fit_transform(df_copy[scaling_cols].values)
+        else:  # Other datasets
+            df_copy[scaling_cols] = scaler.transform(df_copy[scaling_cols].values)
+        scaled_dfs.append(df_copy)
+    
+    return scaled_dfs
+
+# =============================================================================
+# FEATURE SELECTION
+# =============================================================================
+
+def select_features_with_random_forest(X, y, n_estimators=100):
+    """Select important features using Random Forest feature importance."""
+    selector = SelectFromModel(RandomForestClassifier(n_estimators=n_estimators, random_state=SEED))
+    selector.fit(X, y)
+    
+    selected_features = X.columns[selector.get_support()]
+    
+    # Visualize feature importance
+    importance_series = pd.Series(
+        selector.estimator_.feature_importances_.ravel(),
+        index=X.columns
+    )
+    importance_series.plot.bar(figsize=(10, 5))
+    plt.ylabel('Feature importance')
+    plt.title('Feature Importance from Random Forest')
+    plt.show()
+    
+    return selected_features, selector
+
+# =============================================================================
+# MODEL TRAINING AND EVALUATION
+# =============================================================================
+
+def balance_dataset_with_smote(X, y):
+    """Balance dataset using SMOTE oversampling."""
+    smote = SMOTE(random_state=SEED)
+    X_resampled, y_resampled = smote.fit_resample(X, y)
+    
+    print(f'Original dataset shape: {Counter(y)}')
+    print(f'Resampled dataset shape: {Counter(y_resampled)}')
+    
+    return X_resampled, y_resampled
+
+def evaluate_models(models, X_train, y_train, X_val, y_val):
+    """Train multiple models and evaluate their performance."""
+    results = {}
+    
+    for model in models:
+        # Train model
+        model.fit(X_train, y_train)
+        
+        # Make predictions
+        y_pred = model.predict(X_val)
+        
+        # Calculate metrics
+        results[str(model)] = {
+            'accuracy': accuracy_score(y_val, y_pred),
+            'precision': precision_score(y_val, y_pred),
+            'recall': recall_score(y_val, y_pred),
+            'f1_score': f1_score(y_val, y_pred)
+        }
+        
+        # Print results
+        print(f"\nModel: {model}")
+        print(f"Accuracy: {results[str(model)]['accuracy']*100:.2f}%")
+        print(f"Precision: {results[str(model)]['precision']:.2f}")
+        print(f"Recall: {results[str(model)]['recall']:.2f}")
+        print(f"F1 Score: {results[str(model)]['f1_score']:.2f}")
+    
+    return results
+
+def cross_validate_model(model, X, y, cv_folds=5):
+    """Perform k-fold cross-validation on a model."""
+    kf = KFold(n_splits=cv_folds, shuffle=True, random_state=SEED)
+    scores = cross_val_score(model, X, y, cv=kf, scoring='accuracy')
+    
+    print(f"K-Fold Cross-Validation Accuracy Scores: {scores}")
+    print(f"Mean Accuracy: {np.mean(scores):.3f}")
+    print(f"Standard Deviation: {np.std(scores):.3f}")
+    
+    return scores
+
+# =============================================================================
+# MAIN EXECUTION PIPELINE
+# =============================================================================
+
+def main():
+    # Configuration
+    data_path = '/path/to/your/data'  # Update this path
+    
+    # Columns for different processing steps
+    imputation_cols = [
+        'flag_heart_day', 'flag_pressure_day',
+        'max diastolic blood pressure', 'max heart rate', 'max systolic blood pressure', 
+        'min diastolic blood pressure', 'min heart rate', 'min systolic blood pressure',
+        'average diastolic blood pressure', 'average heart rate', 'average systolic blood pressure', 
+        'heart rate', 'breathing rate', 'snoring', 
+        'time to bed', 'time to rise', 
+        'time in bed', 'time out of bed'
+    ]
+    
+    scaling_cols = [
+        'bathroom', 'bedroom', 'door', 'kitchen', 'other_location',
+        'max diastolic blood pressure', 'max heart rate', 'max systolic blood pressure', 
+        'min diastolic blood pressure', 'min heart rate', 'min systolic blood pressure',
+        'average diastolic blood pressure', 'average heart rate', 'average systolic blood pressure', 
+        'heart rate', 'breathing rate', 
+        'time to bed', 'time to rise', 
+        'time in bed', 'time out of bed'
+    ]
+    
+    bool_cols = ['snoring', 'flag_heart_day', 'flag_pressure_day']
+    
+    # Step 1: Load and split data
+    print("Loading data...")
+    train_df, test_df = load_data(data_path)
+    train_df, valid_df, train_df_full = create_validation_split(train_df)
+    
+    print(f"Training patients: {train_df['subject'].nunique()}")
+    print(f"Test patients: {test_df['subject'].nunique()}")
+    
+    # Step 2: Aggregate data
+    print("\nAggregating data...")
+    agg_train_df, agg_valid_df, agg_test_df, agg_train_full_df = aggregate_datasets(
+        train_df, valid_df, test_df, train_df_full
+    )
+    
+    # Step 3: Handle missing values
+    print("\nImputing missing values...")
+    imputed_train_df = impute_missing_values(agg_train_df, imputation_cols)
+    imputed_valid_df = impute_missing_values(agg_valid_df, imputation_cols)
+    imputed_test_df = impute_missing_values(agg_test_df, imputation_cols)
+    imputed_train_full_df = impute_missing_values(agg_train_full_df, imputation_cols)
+    
+    # Step 4: Transform features
+    print("\nTransforming features...")
+    df_list = [imputed_train_df, imputed_valid_df, imputed_test_df, imputed_train_full_df]
+    transformed_dfs = transform_categorical_features(df_list)
+    transformed_dfs = convert_to_boolean(transformed_dfs, bool_cols)
+    
+    # Step 5: Scale features
+    print("\nScaling features...")
+    scaled_dfs = apply_scaling(transformed_dfs, scaling_cols)
+    final_train_df, final_valid_df, final_test_df, final_train_full_df = scaled_dfs
+    
+    # Step 6: Prepare data for modeling
+    print("\nPreparing data for modeling...")
+    train_X = final_train_df.drop('label', axis=1)
+    train_y = final_train_df['label']
+    valid_X = final_valid_df.drop('label', axis=1)
+    valid_y = final_valid_df['label']
+    train_full_X = final_train_full_df.drop('label', axis=1)
+    train_full_y = final_train_full_df['label']
+    
+    # Step 7: Balance dataset
+    print("\nBalancing dataset with SMOTE...")
+    smote_train_X, smote_train_y = balance_dataset_with_smote(train_X, train_y)
+    smote_train_full_X, smote_train_full_y = balance_dataset_with_smote(train_full_X, train_full_y)
+    
+    # Step 8: Feature selection
+    print("\nSelecting features...")
+    smote_train_X_df = pd.DataFrame(smote_train_X, columns=train_X.columns)
+    selected_features, selector = select_features_with_random_forest(smote_train_X_df, smote_train_y)
+    
+    print(f"Selected features: {list(selected_features)}")
+    
+    # Apply feature selection
+    important_features = ['bathroom', 'bedroom', 'door', 'kitchen', 'time to bed', 'other_location']
+    smote_train_X_selected = smote_train_X_df[important_features].values
+    valid_X_selected = valid_X[important_features].values
+    smote_train_full_X_selected = pd.DataFrame(smote_train_full_X, columns=train_full_X.columns)[important_features].values
+    test_X_selected = final_test_df[important_features].values
+    
+    # Step 9: Train and evaluate models
+    print("\nTraining and evaluating models...")
+    models = [
+        KNeighborsClassifier(),
+        RandomForestClassifier(random_state=SEED),
+        LogisticRegression(random_state=SEED),
+        GradientBoostingClassifier(random_state=SEED),
+        SVC(kernel='poly', random_state=SEED),
+        GaussianNB(var_smoothing=0.5)
+    ]
+    
+    results = evaluate_models(models, smote_train_X_selected, smote_train_y, 
+                            valid_X_selected, valid_y)
+    
+    # Step 10: Select best model and make predictions
+    print("\nSelecting best model (KNN) and making final predictions...")
+    best_model = KNeighborsClassifier(
+        n_neighbors=5, weights='uniform', algorithm='auto', 
+        metric='euclidean', leaf_size=30, p=2
+    )
+    
+    # Cross-validate the best model
+    cross_validate_model(best_model, smote_train_full_X_selected, smote_train_full_y)
+    
+    # Train on full dataset and predict
+    best_model.fit(smote_train_full_X_selected, smote_train_full_y)
+    test_predictions = best_model.predict(test_X_selected)
+    
+    # Save predictions
+    predictions_df = pd.DataFrame(test_predictions, columns=['Predicted'])
+    predictions_df.to_csv('test_preds.csv', index=False)
+    print("Predictions saved to 'test_preds.csv'")
+    
+    return best_model, results
+
+if __name__ == "__main__":
+    # Update the data_path in the main() function before running
+    model, evaluation_results = main()
